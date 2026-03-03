@@ -1,0 +1,458 @@
+"""
+PANDA: Passing Attributes between Networks for Data Assimilation algorithm.
+"""
+
+import numpy as np
+import pandas as pd
+from typing import Tuple, Optional, Dict, List, Union
+from .utils import compute_correlation, normalize_network, hamming_distance
+
+
+def run_panda(
+    expression_matrix: np.ndarray,
+    tf_motifs: Union[np.ndarray, pd.DataFrame],
+    ppi_network: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+    alpha: float = 0.1,
+    hamming_threshold: float = 0.001,
+    max_iterations: int = np.inf,
+    correlation_method: str = "pearson",
+    verbose: bool = True,
+    gene_names: Optional[np.ndarray] = None,
+    tf_names: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Run PANDA algorithm for network inference.
+    
+    PANDA integrates three types of networks:
+    1. Regulatory network: TF → gene (based on motif priors)
+    2. Co-regulation network: gene ↔ gene (based on correlation)
+    3. Cooperation network: TF ↔ TF (based on PPI priors)
+    
+    Uses iterative message passing to combine information from all three sources.
+    
+    Parameters
+    ----------
+    expression_matrix : ndarray
+        Gene expression matrix (genes × cells/super-cells).
+    tf_motifs : {ndarray, DataFrame}
+        TF-target motif matrix (n_genes × n_tfs) with weights, or edge list.
+        If edge list: 3 columns [TF, target, weight].
+    ppi_network : {ndarray, DataFrame}, optional
+        Protein-protein interaction matrix (n_tfs × n_tfs) or edge list.
+        If edge list: 3 columns [protein1, protein2, weight].
+    alpha : float, default=0.1
+        Combination parameter (0-1):
+        - alpha=0: pure correlation-based network
+        - alpha=1: pure motif-based network
+        Updated network = alpha * motif + (1-alpha) * correlation
+    hamming_threshold : float, default=0.001
+        Convergence threshold (Hamming distance).
+    max_iterations : int, default=inf
+        Maximum iterations.
+    correlation_method : str, default="pearson"
+        Correlation method: "pearson" or "spearman".
+    verbose : bool, default=True
+        Print iteration progress.
+    gene_names : ndarray, optional
+        Gene names (n_genes,). Used to match motif targets.
+    tf_names : ndarray, optional
+        TF names (n_tfs,). Used to match motif/PPI sources.
+    
+    Returns
+    -------
+    regulatory_network : ndarray
+        Updated TF → gene regulatory network (n_genes × n_tfs).
+    gene_coexpression : ndarray
+        Gene co-expression/co-regulation network (n_genes × n_genes).
+    tf_cooperation : ndarray
+        TF co-operation/protein-protein network (n_tfs × n_tfs).
+    """
+    # Get gene count from expression matrix
+    n_expr_genes = expression_matrix.shape[0]
+    
+    # Build gene name mapping if provided
+    if gene_names is not None:
+        gene_to_idx = {name: i for i, name in enumerate(gene_names)}
+    else:
+        gene_to_idx = {i: i for i in range(n_expr_genes)}
+    
+    # Extract unique TF and gene names from motifs
+    motif_tfs = None
+    motif_targets = None
+    
+    if isinstance(tf_motifs, pd.DataFrame):
+        if tf_motifs.shape[1] == 3:
+            motif_tfs = set(tf_motifs.iloc[:, 0].values)
+            motif_targets = set(tf_motifs.iloc[:, 1].values)
+    else:
+        if tf_motifs.ndim == 2 and tf_motifs.shape[1] == 3:
+            motif_tfs = set(tf_motifs[:, 0])
+            motif_targets = set(tf_motifs[:, 1])
+    
+    # Extract unique TF names from PPI
+    ppi_tfs = set()
+    if ppi_network is not None:
+        if isinstance(ppi_network, pd.DataFrame):
+            if ppi_network.shape[1] >= 2:
+                ppi_tfs.update(ppi_network.iloc[:, 0].values)
+                ppi_tfs.update(ppi_network.iloc[:, 1].values)
+        else:
+            if ppi_network.ndim == 2 and ppi_network.shape[1] >= 2:
+                ppi_tfs.update(ppi_network[:, 0])
+                ppi_tfs.update(ppi_network[:, 1])
+    
+    # Apply intersection filtering (R's default mode="intersection"):
+    # - Keep genes that are in BOTH expression AND motif targets
+    # - Keep TFs that are in BOTH motifs AND PPI
+    
+    # Only apply intersection filtering if we have gene/TF names available
+    # If gene_names is None and motifs use string targets, skip filtering
+    if gene_names is not None or gene_to_idx != {i: i for i in range(n_expr_genes)}:
+        # Gene names available - apply intersection filtering
+        expr_genes = set(gene_to_idx.keys())
+        
+        if motif_targets:
+            # Only keep targets that exist in expression
+            valid_genes = sorted(list(expr_genes & motif_targets))
+        else:
+            valid_genes = sorted(list(expr_genes))
+        
+        if motif_tfs and ppi_tfs:
+            valid_tfs = sorted(list(motif_tfs & ppi_tfs))
+        elif motif_tfs:
+            valid_tfs = sorted(list(motif_tfs))
+        else:
+            valid_tfs = []
+    else:
+        # No gene/TF names available - try to parse motif as numeric indices
+        # Try numeric motif targets (indices) - if they're all numeric, use them
+        if motif_targets:
+            try:
+                # Try to convert all targets to int
+                numeric_targets = set()
+                for target in motif_targets:
+                    if isinstance(target, (int, np.integer)):
+                        numeric_targets.add(target)
+                    elif isinstance(target, str) and target.isdigit():
+                        numeric_targets.add(int(target))
+                
+                if len(numeric_targets) == len(motif_targets):
+                    # All targets are numeric
+                    expr_genes = set(range(n_expr_genes))
+                    valid_genes = sorted(list(expr_genes & numeric_targets))
+                else:
+                    # Mixed numeric/string - use all genes
+                    valid_genes = sorted(list(range(n_expr_genes)))
+            except (ValueError, TypeError):
+                # Can't parse as numeric - use all genes
+                valid_genes = sorted(list(range(n_expr_genes)))
+        else:
+            valid_genes = sorted(list(range(n_expr_genes)))
+        
+        if motif_tfs and ppi_tfs:
+            valid_tfs = sorted(list(motif_tfs & ppi_tfs))
+        elif motif_tfs:
+            valid_tfs = sorted(list(motif_tfs))
+        else:
+            valid_tfs = []
+    
+    # Build mappings from valid gene/TF names to indices
+    valid_gene_to_idx = {name: i for i, name in enumerate(valid_genes)}
+    valid_tf_to_idx = {name: i for i, name in enumerate(valid_tfs)}
+    
+    n_valid_genes = len(valid_genes)
+    n_valid_tfs = len(valid_tfs)
+    
+    # Check if we have valid genes/TFs
+    if n_valid_genes == 0 or n_valid_tfs == 0:
+        # No valid genes or TFs - use fallback: all genes, all TFs from motifs
+        valid_genes = sorted(list(set(gene_to_idx.keys())))
+        if motif_tfs:
+            valid_tfs = sorted(list(motif_tfs))
+        else:
+            valid_tfs = sorted(list(set(
+                [row[0] for row in tf_motifs.values if hasattr(tf_motifs, 'values')] if isinstance(tf_motifs, pd.DataFrame) else
+                [row[0] for row in tf_motifs if isinstance(tf_motifs, np.ndarray)]
+            )))
+        
+        valid_gene_to_idx = {name: i for i, name in enumerate(valid_genes)}
+        valid_tf_to_idx = {name: i for i, name in enumerate(valid_tfs)}
+        
+        n_valid_genes = len(valid_genes)
+        n_valid_tfs = len(valid_tfs)
+    
+    # Parse motif matrix - using intersection-filtered genes and TFs
+    # Matrix should be (n_genes, n_tfs) following Python conventions
+    if isinstance(tf_motifs, pd.DataFrame):
+        if tf_motifs.shape[1] == 3:
+            # Edge list format: [TF, target, weight]
+            motif_df = tf_motifs.copy()
+            
+            # Create matrix for valid genes and TFs
+            motif_matrix = np.zeros((n_valid_genes, n_valid_tfs))
+            
+            for _, row in motif_df.iterrows():
+                tf = row.iloc[0]
+                target = row.iloc[1]
+                weight = row.iloc[2]
+                
+                tf_idx = valid_tf_to_idx.get(tf)
+                if tf_idx is None:
+                    continue
+                
+                # Try to match target to valid gene
+                gene_idx = None
+                try:
+                    if isinstance(target, (int, np.integer)):
+                        gene_idx = target
+                    elif isinstance(target, str) and target.isdigit():
+                        gene_idx = int(target)
+                    else:
+                        # Try gene name lookup in valid genes
+                        gene_idx = valid_gene_to_idx.get(target)
+                except (ValueError, TypeError, AttributeError):
+                    gene_idx = None
+                
+                # Validate gene index
+                if gene_idx is not None and isinstance(gene_idx, (int, np.integer)):
+                    if 0 <= gene_idx < n_valid_genes:
+                        motif_matrix[gene_idx, tf_idx] = weight
+        else:
+            motif_matrix = tf_motifs.values
+    else:
+        if tf_motifs.ndim == 2 and tf_motifs.shape[1] == 3:
+            # Edge list format with ndarray
+            motif_matrix = np.zeros((n_valid_genes, n_valid_tfs))
+            
+            for row in tf_motifs:
+                tf = row[0]
+                target = row[1]
+                weight = row[2]
+                
+                tf_idx = valid_tf_to_idx.get(tf)
+                if tf_idx is None:
+                    continue
+                
+                # Try to match target
+                gene_idx = None
+                try:
+                    if isinstance(target, (int, np.integer)):
+                        gene_idx = target
+                    elif isinstance(target, str) and target.isdigit():
+                        gene_idx = int(target)
+                    else:
+                        gene_idx = valid_gene_to_idx.get(target)
+                except (ValueError, TypeError, AttributeError):
+                    gene_idx = None
+                
+                if gene_idx is not None and isinstance(gene_idx, (int, np.integer)):
+                    if 0 <= gene_idx < n_valid_genes:
+                        motif_matrix[gene_idx, tf_idx] = weight
+        else:
+            motif_matrix = tf_motifs
+    
+    n_genes, n_tfs = motif_matrix.shape
+
+    
+    # Filter expression matrix to keep only valid genes
+    if valid_genes and gene_names is not None:
+        # Select rows corresponding to valid genes
+        valid_gene_indices = [gene_to_idx[name] for name in valid_genes if name in gene_to_idx]
+        expression_matrix_filtered = expression_matrix[valid_gene_indices, :]
+    else:
+        expression_matrix_filtered = expression_matrix
+    
+    # Compute gene co-expression correlation matrix
+    gene_coexpression = compute_correlation(expression_matrix_filtered, method=correlation_method)
+    
+    # Replace NaN with 0 (genes with no variance)
+    gene_coexpression = np.nan_to_num(gene_coexpression, nan=0.0)
+    
+    # Ensure gene_coexpression matches motif matrix gene count
+    if gene_coexpression.shape[0] != n_genes:
+        # Need to resize - create square matrix of size n_genes × n_genes
+        resized = np.eye(n_genes)
+        min_size = min(gene_coexpression.shape[0], n_genes)
+        resized[:min_size, :min_size] = gene_coexpression[:min_size, :min_size]
+        gene_coexpression = resized
+    
+    # Normalize correlation to [0, 1] range
+    gene_min = gene_coexpression.min()
+    gene_max = gene_coexpression.max()
+    if gene_max > gene_min:
+        gene_coexpression = (gene_coexpression - gene_min) / (gene_max - gene_min)
+    else:
+        gene_coexpression = np.zeros_like(gene_coexpression)
+    
+    # Parse PPI network - create matrix matching n_tfs using valid TFs
+    if ppi_network is None:
+        # No PPI prior: identity matrix
+        tf_cooperation = np.eye(n_tfs)
+    else:
+        if isinstance(ppi_network, pd.DataFrame):
+            if ppi_network.shape[1] == 3:
+                # Edge list format: [protein1, protein2, weight]
+                ppi_df = ppi_network.copy()
+                
+                # Only keep edges between valid TFs
+                ppi_df = ppi_df[ppi_df.iloc[:, 0].isin(valid_tfs)]
+                ppi_df = ppi_df[ppi_df.iloc[:, 1].isin(valid_tfs)]
+                
+                # Create PPI matrix for valid TFs
+                tf_cooperation = np.zeros((n_tfs, n_tfs))
+                
+                for _, row in ppi_df.iterrows():
+                    p1 = row.iloc[0]
+                    p2 = row.iloc[1]
+                    weight = row.iloc[2]
+                    
+                    p1_idx = valid_tf_to_idx.get(p1)
+                    p2_idx = valid_tf_to_idx.get(p2)
+                    if p1_idx is not None and p2_idx is not None:
+                        tf_cooperation[p1_idx, p2_idx] = weight
+                        tf_cooperation[p2_idx, p1_idx] = weight  # Symmetric
+                
+                # Set diagonal to 1 (self-cooperation)
+                np.fill_diagonal(tf_cooperation, 1.0)
+            else:
+                tf_cooperation = np.asarray(ppi_network.values, dtype=float)
+        else:
+            if ppi_network.ndim == 2 and ppi_network.shape[1] == 3:
+                # Edge list format with ndarray
+                # Create PPI matrix for valid TFs
+                tf_cooperation = np.zeros((n_tfs, n_tfs))
+                
+                for row in ppi_network:
+                    p1 = row[0]
+                    p2 = row[1]
+                    weight = row[2]
+                    
+                    p1_idx = valid_tf_to_idx.get(p1)
+                    p2_idx = valid_tf_to_idx.get(p2)
+                    if p1_idx is not None and p2_idx is not None:
+                        tf_cooperation[p1_idx, p2_idx] = weight
+                        tf_cooperation[p2_idx, p1_idx] = weight
+                
+                # Set diagonal to 1 (self-cooperation)
+                np.fill_diagonal(tf_cooperation, 1.0)
+            else:
+                # Already a matrix
+                tf_cooperation = np.asarray(ppi_network, dtype=float)
+    
+    # Ensure TF cooperation is square and of size n_tfs × n_tfs
+    if tf_cooperation.shape[0] != n_tfs or tf_cooperation.shape[1] != n_tfs:
+        # Need to resize
+        resized = np.eye(n_tfs)
+        min_size = min(tf_cooperation.shape[0], n_tfs)
+        resized[:min_size, :min_size] = tf_cooperation[:min_size, :min_size]
+        tf_cooperation = resized
+    
+    # Make symmetric and set diagonal to 1
+    tf_cooperation = (tf_cooperation + tf_cooperation.T) / 2
+    np.fill_diagonal(tf_cooperation, 1.0)
+    
+    # Initialize regulatory network
+    regulatory_network = motif_matrix.copy()
+    
+    # Iterative message passing
+    iteration = 0
+    converged = False
+    
+    while not converged and iteration < max_iterations:
+        # Store old network for convergence check
+        old_regulatory = regulatory_network.copy()
+        
+        # PANDA message passing update for regulatory network
+        # Update based on:
+        # 1. Motif prior (weighted by alpha)
+        # 2. Gene similarity patterns from coexpression (weighted by 1-alpha)
+        
+        # Compute gene-based agreement: how well does each gene pair match via coexpression?
+        # Genes that are coexpressed support TF targets that regulate them
+        # For each (gene, TF): compute agreement as:
+        #   correlation with other genes that have similar TF support
+        
+        # Simplified PANDA: blend motif with correlation predictiveness
+        # Build predicted network from current regulatory network via coexpression
+        # Genes that are coexpressed should be regulated similarly
+        predicted_net = np.zeros_like(regulatory_network)
+        for gene_i in range(n_genes):
+            for tf_j in range(n_tfs):
+                # For this gene-TF pair, check coexpression-based support
+                # Sum coexpression to similar genes weighted by their TF support
+                similar_genes = gene_coexpression[gene_i, :]
+                tf_predicted = np.dot(similar_genes, regulatory_network[:, tf_j])
+                predicted_net[gene_i, tf_j] = tf_predicted / (np.sum(np.abs(similar_genes)) + 1e-10)
+        
+        # Normalize predicted network
+        predicted_net = normalize_network(predicted_net, method="range")
+        
+        # Update regulatory network: blend motif with coexpression-predicted
+        regulatory_network = alpha * motif_matrix + (1 - alpha) * predicted_net
+        
+        # Update TF cooperation based on similarity of regulatory targets
+        tf_similarity = regulatory_network.T @ regulatory_network  # DTD (TF x TF)
+        tf_similarity = normalize_network(tf_similarity, method="range")
+        tf_cooperation = (tf_cooperation + tf_similarity) / 2  # Blend with PPI
+        
+        # Update gene co-expression based on shared TF targets  
+        gene_similarity = regulatory_network @ regulatory_network.T  # D @ D^T (gene x gene)
+        gene_similarity = normalize_network(gene_similarity, method="range")
+        gene_coexpression = (gene_coexpression + gene_similarity) / 2  # Blend with expression correlation
+        
+        # Check convergence
+        hamming = hamming_distance(old_regulatory, regulatory_network)
+        
+        if verbose and (iteration % 10 == 0 or iteration < 5):
+            print(f"PANDA iteration {iteration}: Hamming distance = {hamming:.6f}")
+        
+        if hamming < hamming_threshold:
+            converged = True
+            if verbose:
+
+                print(f"PANDA converged at iteration {iteration}")
+        
+        iteration += 1
+    
+    if verbose and not converged:
+        print(f"PANDA reached max iterations ({max_iterations}) without convergence")
+    
+    return regulatory_network, gene_coexpression, tf_cooperation
+
+
+def integrate_networks(
+    regulatory_network: np.ndarray,
+    gene_coexpression: np.ndarray,
+    tf_cooperation: np.ndarray,
+    z_scaling: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Integrate and normalize PANDA output networks.
+    
+    Parameters
+    ----------
+    regulatory_network : ndarray
+        TF → gene regulatory weights (n_genes × n_tfs).
+    gene_coexpression : ndarray
+        Gene co-expression weights (n_genes × n_genes).
+    tf_cooperation : ndarray
+        TF cooperation weights (n_tfs × n_tfs).
+    z_scaling : bool, default=True
+        Apply z-score normalization. If False, use [0,1] scaling.
+    
+    Returns
+    -------
+    reg_net_scaled : ndarray
+        Normalized regulatory network.
+    coexp_net_scaled : ndarray
+        Normalized co-expression network.
+    coop_net_scaled : ndarray
+        Normalized cooperation network.
+    """
+    method = "zscore" if z_scaling else "range"
+    
+    reg_net_scaled = normalize_network(regulatory_network, method=method)
+    coexp_net_scaled = normalize_network(gene_coexpression, method=method)
+    coop_net_scaled = normalize_network(tf_cooperation, method=method)
+    
+    return reg_net_scaled, coexp_net_scaled, coop_net_scaled

@@ -1,0 +1,511 @@
+"""
+Core SCORPION functions: scorpion() and run_scorpion().
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.sparse import issparse, csr_matrix, csc_matrix
+from typing import Union, Optional, List, Tuple, Dict
+import warnings
+
+from .preprocessing import (
+    validate_inputs, log_normalize_data, remove_batch_effect, filter_expression
+)
+from .graph_utils import make_super_cells, aggregate_by_groups
+from .panda import run_panda, integrate_networks
+from .utils import (
+    matrix_to_edge_list, restrict_networks, normalize_network, set_random_seed
+)
+
+
+def scorpion(
+    gex_matrix: Union[np.ndarray, csr_matrix, csc_matrix, pd.DataFrame],
+    tf_motifs: Union[np.ndarray, pd.DataFrame],
+    ppi_net: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+    computing_engine: str = "cpu",
+    n_cores: int = 1,
+    gamma_value: int = 10,
+    n_pc: int = 25,
+    assoc_method: str = "pearson",
+    alpha_value: float = 0.1,
+    hamming_value: float = 0.001,
+    n_iter: int = np.inf,
+    out_net: Union[str, List[str]] = "regNet",
+    z_scaling: bool = True,
+    show_progress: bool = True,
+    randomization_method: str = "None",
+    scale_by_present: bool = False,
+    filter_expr: bool = False,
+    random_state: Optional[int] = None,
+) -> Dict:
+    """
+    Infer a gene regulatory network for a single cell group.
+    
+    SCORPION: Single-Cell Oriented Reconstruction of PANDA Individually Optimized
+    Gene Regulatory Networks.
+    
+    Creates super-cells (aggregated cell groups) from expression data to improve
+    correlation detection, then runs PANDA to integrate motif priors, PPI priors,
+    and expression correlation.
+    
+    Parameters
+    ----------
+    gex_matrix : {ndarray, csr_matrix, csc_matrix, DataFrame}
+        Gene expression matrix (genes × cells).
+        Values can be raw counts or log-normalized.
+    tf_motifs : {ndarray, DataFrame}
+        TF-target motif prior. Either:
+        - Matrix (n_genes × n_tfs) with [0,1] weights
+        - DataFrame edge list: [TF, target, weight]
+    ppi_net : {ndarray, DataFrame}, optional
+        Protein-protein interaction prior. Either:
+        - Matrix (n_tfs × n_tfs) with [0,1] weights
+        - DataFrame edge list: [protein1, protein2, weight]
+    computing_engine : str, default="cpu"
+        Compute engine ("cpu" or "gpu", gpu not yet implemented).
+    n_cores : int, default=1
+        Number of cores for parallelization (currently unused).
+    gamma_value : int, default=10
+        Coarse-graining level: target ratio of cells to super-cells.
+        Actual super-cells determined by community detection.
+    n_pc : int, default=25
+        Number of PCA components for kNN graph construction.
+    assoc_method : str, default="pearson"
+        Association/correlation method: "pearson" or "spearman".
+    alpha_value : float, default=0.1
+        PANDA alpha parameter (0-1). Controls motif vs. correlation balance:
+        - 0: pure correlation
+        - 1: pure motif prior
+    hamming_value : float, default=0.001
+        Convergence threshold for PANDA (Hamming distance).
+    n_iter : int, default=inf
+        Maximum PANDA iterations.
+    out_net : {str, list}, default="regNet"
+        Networks to return: "regNet" (TF→gene), "coregNet" (gene↔gene),
+        "coopNet" (TF↔TF), or list of multiple.
+    z_scaling : bool, default=True
+        Scale networks to z-scores. If False, scales to [0,1].
+    show_progress : bool, default=True
+        Print progress messages.
+    randomization_method : str, default="None"
+        Randomization method for null model (not yet implemented).
+    scale_by_present : bool, default=False
+        Scale by genes/TFs present in data (not yet implemented).
+    filter_expr : bool, default=False
+        Filter zero-expression genes before analysis.
+    random_state : int, optional
+        Random seed for reproducibility.
+    
+    Returns
+    -------
+    result : dict
+        Dictionary with keys:
+        - "regNet": TF→gene regulatory network (n_genes × n_tfs)
+        - "coregNet": Gene co-regulation network (n_genes × n_genes)
+        - "coopNet": TF cooperation network (n_tfs × n_tfs)
+        - "numGenes": Number of genes in network
+        - "numTFs": Number of TFs in network
+        - "numEdges": Number of edges in regulatory network
+        - "motifPrior": Original motif prior matrix
+        - "ppiPrior": Original PPI prior matrix
+    
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import pandas as pd
+    >>> from scorpion import scorpion
+    >>> 
+    >>> # Create toy data
+    >>> gex = np.random.poisson(5, (1000, 100))  # 1000 genes, 100 cells
+    >>> motifs = pd.DataFrame({
+    ...     "tf": ["TF1", "TF2", "TF1"],
+    ...     "target": ["gene1", "gene2", "gene3"],
+    ...     "weight": [0.8, 0.7, 0.6]
+    ... })
+    >>> 
+    >>> net = scorpion(gex, motifs, gamma_value=10, n_pc=10)
+    >>> print(net["regNet"].shape)
+    >>> print(f"Edges: {net['numEdges']}")
+    """
+    if random_state is not None:
+        set_random_seed(random_state)
+    
+    # Validate parameters
+    if not (0 <= alpha_value <= 1):
+        raise ValueError(f"alpha_value must be in [0, 1], got {alpha_value}")
+    if gamma_value <= 0:
+        raise ValueError(f"gamma_value must be positive, got {gamma_value}")
+    if n_pc <= 0:
+        raise ValueError(f"n_pc must be positive, got {n_pc}")
+    
+    # Convert output network specification
+    if isinstance(out_net, str):
+        out_net = [out_net]
+    
+    # Convert expression matrix to numpy array and extract gene names
+    gene_names = None
+    if issparse(gex_matrix):
+        gex_array = gex_matrix.toarray()
+        if hasattr(gex_matrix, 'index'):
+            gene_names = gex_matrix.index.values
+    elif isinstance(gex_matrix, pd.DataFrame):
+        gene_names = gex_matrix.index.values
+        gex_array = gex_matrix.values
+    else:
+        gex_array = np.asarray(gex_matrix, dtype=float)
+    
+    n_genes, n_cells = gex_array.shape
+    
+    if show_progress:
+        print(f"SCORPION: {n_genes} genes × {n_cells} cells")
+    
+    # Filter expression if requested
+    if filter_expr:
+        gex_array = filter_expression(gex_array, min_cells=1)
+        n_genes = gex_array.shape[0]
+        if show_progress:
+            print(f"  After filtering: {n_genes} genes")
+    
+    # Normalize expression
+    gex_normalized = log_normalize_data(gex_array)
+    
+    # Create super-cells
+    if show_progress:
+        print(f"Creating super-cells with gamma={gamma_value}...")
+    
+    super_cell_expr, super_cell_assignment, _, super_cell_names = make_super_cells(
+        gex_normalized,
+        gamma=gamma_value,
+        n_pcs=n_pc,
+        k_nn=5,
+        random_state=random_state,
+    )
+    
+    n_super_cells = super_cell_expr.shape[1]
+    if show_progress:
+        print(f"  Created {n_super_cells} super-cells")
+    
+    # Run PANDA on super-cells
+    if show_progress:
+        print(f"Running PANDA (alpha={alpha_value})...")
+    
+    # Extract TF names if available
+    tf_names = None
+    if isinstance(tf_motifs, pd.DataFrame):
+        if tf_motifs.shape[1] == 3:
+            # Edge list format - get unique TF names from first column
+            tf_names = sorted(set(tf_motifs.iloc[:, 0].values))
+    
+    reg_net, coexp_net, coop_net = run_panda(
+        super_cell_expr,
+        tf_motifs,
+        ppi_network=ppi_net,
+        alpha=alpha_value,
+        hamming_threshold=hamming_value,
+        max_iterations=int(n_iter) if n_iter != np.inf else 10000,
+        correlation_method=assoc_method,
+        gene_names=gene_names,
+        tf_names=tf_names,
+        verbose=show_progress,
+    )
+    
+    # Normalize networks
+    if show_progress:
+        print(f"Normalizing networks (z_scaling={z_scaling})...")
+    
+    reg_net, coexp_net, coop_net = integrate_networks(
+        reg_net, coexp_net, coop_net, z_scaling=z_scaling
+    )
+    
+    # Collect results
+    result = {}
+    
+    if "regNet" in out_net:
+        result["regNet"] = reg_net
+    if "coregNet" in out_net:
+        result["coregNet"] = coexp_net
+    if "coopNet" in out_net:
+        result["coopNet"] = coop_net
+    
+    # Add metadata
+    result["numGenes"] = reg_net.shape[0]
+    result["numTFs"] = reg_net.shape[1]
+    result["numEdges"] = np.sum(reg_net != 0)
+    result["motifPrior"] = tf_motifs
+    result["ppiPrior"] = ppi_net
+    
+    if show_progress:
+        print(f"Complete: {result['numEdges']} edges")
+    
+    return result
+
+
+def run_scorpion(
+    gex_matrix: Union[np.ndarray, csr_matrix, csc_matrix, pd.DataFrame],
+    tf_motifs: Union[np.ndarray, pd.DataFrame],
+    ppi_net: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+    cells_metadata: pd.DataFrame = None,
+    group_by: Union[str, List[str]] = None,
+    normalize_data: bool = True,
+    remove_batch_effect: bool = False,
+    batch: Optional[str] = None,
+    min_cells: int = 30,
+    computing_engine: str = "cpu",
+    n_cores: int = 1,
+    gamma_value: int = 10,
+    n_pc: int = 25,
+    assoc_method: str = "pearson",
+    alpha_value: float = 0.1,
+    hamming_value: float = 0.001,
+    n_iter: int = np.inf,
+    out_net: str = "regNet",
+    z_scaling: bool = True,
+    show_progress: bool = True,
+    randomization_method: str = "None",
+    scale_by_present: bool = False,
+    filter_expr: bool = False,
+    random_state: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Run SCORPION on cell groups to infer stratified gene regulatory networks.
+    
+    Infers one network per cell group (e.g., per cell type, donor, region, or
+    combination thereof). Returns a wide-format edge list with edges as rows
+    and cell groups as columns.
+    
+    Parameters
+    ----------
+    gex_matrix : {ndarray, csr_matrix, csc_matrix, DataFrame}
+        Gene expression matrix (genes × cells).
+    tf_motifs : {ndarray, DataFrame}
+        TF-target motif prior (see scorpion() docs).
+    ppi_net : {ndarray, DataFrame}, optional
+        Protein-protein interaction prior (see scorpion() docs).
+    cells_metadata : DataFrame
+        Cell metadata (rows=cells, columns=annotations).
+        One row per cell, matching gex_matrix columns.
+    group_by : {str, list}, optional
+        Column(s) in cells_metadata to group by.
+        If list, creates groups from combinations of columns.
+    normalize_data : bool, default=True
+        Log-normalize expression matrix.
+    remove_batch_effect : bool, default=False
+        Remove batch effects before network inference.
+    batch : str, optional
+        Batch column name in cells_metadata. Required if
+        remove_batch_effect=True.
+    min_cells : int, default=30
+        Minimum cells per group. Groups with fewer cells are skipped.
+    computing_engine : str, default="cpu"
+        Compute engine ("cpu" or "gpu").
+    n_cores : int, default=1
+        Number of cores for parallelization.
+    gamma_value : int, default=10
+        Coarse-graining level for super-cells.
+    n_pc : int, default=25
+        PCA components for super-cell kNN.
+    assoc_method : str, default="pearson"
+        Correlation method.
+    alpha_value : float, default=0.1
+        PANDA alpha parameter.
+    hamming_value : float, default=0.001
+        PANDA convergence threshold.
+    n_iter : int, default=inf
+        PANDA max iterations.
+    out_net : str, default="regNet"
+        Output network: "regNet", "coregNet", or "coopNet".
+    z_scaling : bool, default=True
+        Scale networks to z-scores.
+    show_progress : bool, default=True
+        Print progress.
+    randomization_method : str, default="None"
+        Randomization method (not implemented).
+    scale_by_present : bool, default=False
+        Scale by present genes/TFs (not implemented).
+    filter_expr : bool, default=False
+        Filter zero-expression genes.
+    random_state : int, optional
+        Random seed.
+    
+    Returns
+    -------
+    result : DataFrame
+        Wide-format edge list:
+        - Column 1: "tf" (source gene name)
+        - Column 2: "target" (target gene name)
+        - Remaining columns: Network weights for each group
+        
+        Example:
+        ```
+               tf target     donor_A     donor_B
+        0    TF1   gene1  -0.123      0.456
+        1    TF1   gene2   0.789     -0.234
+        ```
+    
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> import numpy as np
+    >>> from scorpion import run_scorpion
+    >>> 
+    >>> # Simulate data
+    >>> gex = np.random.poisson(5, (1000, 200))
+    >>> metadata = pd.DataFrame({
+    ...     "cell_id": [f"cell_{i}" for i in range(200)],
+    ...     "cell_type": ["TypeA"] * 100 + ["TypeB"] * 100
+    ... })
+    >>> motifs = pd.DataFrame({
+    ...     "tf": ["TF1"] * 50,
+    ...     "target": [f"gene_{i}" for i in range(50)],
+    ...     "weight": np.random.uniform(0.5, 1.0, 50)
+    ... })
+    >>> 
+    >>> networks = run_scorpion(
+    ...     gex, motifs, cells_metadata=metadata, group_by="cell_type"
+    ... )
+    >>> print(networks.shape)
+    """
+    if random_state is not None:
+        set_random_seed(random_state)
+    
+    # Validate inputs
+    valid, msg = validate_inputs(
+        gex_matrix, tf_motifs, cells_metadata, ppi_net,
+        group_by, alpha_value, gamma_value, n_pc, batch
+    )
+    if not valid:
+        raise ValueError(f"Input validation failed: {msg}")
+    
+    # Convert expression matrix
+    if issparse(gex_matrix):
+        gex_array = gex_matrix.toarray()
+    elif isinstance(gex_matrix, pd.DataFrame):
+        gex_array = gex_matrix.values
+    else:
+        gex_array = np.asarray(gex_matrix, dtype=float)
+    
+    n_genes, n_cells = gex_array.shape
+    
+    if show_progress:
+        print(f"runSCORPION: {n_genes} genes × {n_cells} cells")
+    
+    # Normalize if requested
+    if normalize_data:
+        if show_progress:
+            print("Normalizing expression...")
+        gex_array = log_normalize_data(gex_array)
+    
+    # Remove batch effects if requested
+    if remove_batch_effect and batch is not None:
+        if show_progress:
+            print(f"Removing batch effects ({batch})...")
+        batch_labels = cells_metadata[batch].values
+        gex_array = remove_batch_effect(gex_array, batch_labels)
+    
+    # Determine cell groups
+    if group_by is None:
+        # Single network for all cells
+        groups_df = pd.DataFrame({"__group__": ["all"] * n_cells})
+        group_by_cols = ["__group__"]
+    else:
+        if isinstance(group_by, str):
+            group_by_cols = [group_by]
+        else:
+            group_by_cols = group_by
+        groups_df = cells_metadata[group_by_cols].copy()
+    
+    # Create group IDs
+    if len(group_by_cols) == 1:
+        group_ids = groups_df[group_by_cols[0]].astype(str).values
+        group_names = sorted(set(group_ids))
+    else:
+        # Combine columns
+        group_ids = groups_df[group_by_cols].astype(str).apply(
+            lambda row: "__".join(row.values), axis=1
+        ).values
+        group_names = sorted(set(group_ids))
+    
+    if show_progress:
+        print(f"Found {len(group_names)} groups")
+    
+    # Infer networks per group
+    networks_dict = {}
+    
+    for group_name in group_names:
+        group_mask = group_ids == group_name
+        n_group_cells = np.sum(group_mask)
+        
+        if n_group_cells < min_cells:
+            if show_progress:
+                print(f"  Skipping {group_name} ({n_group_cells} cells < {min_cells})")
+            continue
+        
+        if show_progress:
+            print(f"  Processing {group_name} ({n_group_cells} cells)...")
+        
+        gex_group = gex_array[:, group_mask]
+        
+        # Run scorpion on this group
+        result = scorpion(
+            gex_group,
+            tf_motifs,
+            ppi_net=ppi_net,
+            gamma_value=gamma_value,
+            n_pc=n_pc,
+            assoc_method=assoc_method,
+            alpha_value=alpha_value,
+            hamming_value=hamming_value,
+            n_iter=n_iter,
+            out_net=[out_net],  # Single network type
+            z_scaling=z_scaling,
+            show_progress=False,  # Suppress sub-progress
+            random_state=random_state,
+        )
+        
+        networks_dict[group_name] = result[out_net]
+    
+    if show_progress:
+        print(f"Combining results from {len(networks_dict)} groups...")
+    
+    # Convert networks to edge lists and combine
+    all_edges = {}
+    
+    for group_name, net_matrix in networks_dict.items():
+        # Convert matrix to edge list
+        edge_list = matrix_to_edge_list(
+            net_matrix,
+            row_names=[f"gene_{i}" for i in range(net_matrix.shape[0])],
+            col_names=[f"tf_{j}" for j in range(net_matrix.shape[1])],
+            include_zeros=False,
+        )
+        
+        # Store weights by edge
+        for _, row in edge_list.iterrows():
+            edge_key = (row["source"], row["target"])
+            if edge_key not in all_edges:
+                all_edges[edge_key] = {"tf": row["source"], "target": row["target"]}
+            all_edges[edge_key][group_name] = row["weight"]
+    
+    # Convert to DataFrame
+    if not all_edges:
+        # No edges were created - return empty DataFrame with correct columns
+        result_df = pd.DataFrame(columns=["tf", "target"])
+    else:
+        result_df = pd.DataFrame(list(all_edges.values()))
+        
+        # Ensure we have tf and target columns
+        if "tf" not in result_df.columns or "target" not in result_df.columns:
+            result_df = pd.DataFrame(columns=["tf", "target"])
+        else:
+            # Reorder columns: tf, target, then groups
+            group_cols = sorted([c for c in result_df.columns if c not in ["tf", "target"]])
+            if group_cols:
+                result_df = result_df[["tf", "target"] + group_cols]
+            
+            # Fill NaN with 0 (edges not present in all groups)
+            result_df = result_df.fillna(0.0)
+    
+    if show_progress:
+        print(f"Results: {result_df.shape[0]} edges × {result_df.shape[1]} columns")
+    
+    return result_df

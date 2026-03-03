@@ -1,0 +1,341 @@
+"""
+Graph-based utilities: kNN graph construction, community detection, super-cell creation.
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.sparse import csr_matrix, lil_matrix
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+from typing import Tuple, List, Optional
+
+
+def build_pca(
+    data: np.ndarray,
+    n_components: int = 25,
+    random_state: Optional[int] = None,
+) -> Tuple[PCA, np.ndarray]:
+    """
+    Perform PCA dimensionality reduction.
+    
+    Parameters
+    ----------
+    data : ndarray
+        Input data (n_samples × n_features).
+    n_components : int, default=25
+        Number of principal components.
+    random_state : int, optional
+        Random seed for reproducibility.
+    
+    Returns
+    -------
+    pca : PCA
+        Fitted PCA model.
+    transformed : ndarray
+        Transformed data (n_samples × n_components).
+    """
+    pca = PCA(n_components=n_components, random_state=random_state)
+    transformed = pca.fit_transform(data)
+    return pca, transformed
+
+
+def build_knn_graph(
+    data: np.ndarray,
+    k: int = 5,
+    metric: str = "euclidean",
+    random_state: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build k-nearest neighbor graph using PCA-reduced data.
+    
+    Parameters
+    ----------
+    data : ndarray
+        Input data (n_cells × n_features, typically genes × cells transposed).
+    k : int, default=5
+        Number of nearest neighbors.
+    metric : str, default="euclidean"
+        Distance metric for NN search.
+    random_state : int, optional
+        Random seed.
+    
+    Returns
+    -------
+    neighbor_indices : ndarray
+        Neighbor indices (n_cells × k).
+    neighbor_distances : ndarray
+        Distances to neighbors (n_cells × k).
+    """
+    nbrs = NearestNeighbors(n_neighbors=k + 1, metric=metric, algorithm='auto').fit(data)
+    distances, indices = nbrs.kneighbors(data)
+    
+    # Remove self-loops (first neighbor is always self)
+    neighbor_distances = distances[:, 1:]
+    neighbor_indices = indices[:, 1:]
+    
+    return neighbor_indices, neighbor_distances
+
+
+def build_knn_sparse_matrix(
+    neighbor_indices: np.ndarray,
+    n_nodes: int = None,
+    symmetric: bool = True,
+) -> csr_matrix:
+    """
+    Convert kNN indices to sparse adjacency matrix.
+    
+    Parameters
+    ----------
+    neighbor_indices : ndarray
+        Neighbor indices (n_nodes × k).
+    n_nodes : int, optional
+        Number of nodes. If None, inferred from indices.
+    symmetric : bool, default=True
+        Make adjacency matrix symmetric (add reverse edges).
+    
+    Returns
+    -------
+    adjacency : csr_matrix
+        Sparse adjacency matrix (n_nodes × n_nodes).
+    """
+    if n_nodes is None:
+        n_nodes = neighbor_indices.shape[0]
+    
+    adj = lil_matrix((n_nodes, n_nodes))
+    
+    for i in range(neighbor_indices.shape[0]):
+        for j in neighbor_indices[i]:
+            adj[i, j] = 1
+            if symmetric:
+                adj[j, i] = 1
+    
+    return adj.tocsr()
+
+
+def find_communities_louvain(
+    adjacency_matrix: csr_matrix,
+    random_state: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Detect communities using Louvain algorithm (via networkx).
+    
+    Parameters
+    ----------
+    adjacency_matrix : csr_matrix
+        Symmetric adjacency matrix.
+    random_state : int, optional
+        Random seed.
+    
+    Returns
+    -------
+    communities : ndarray
+        Community assignment for each node (0-indexed).
+    """
+    try:
+        import networkx as nx
+        from networkx.algorithms import community
+    except ImportError:
+        raise ImportError(
+            "networkx required for community detection. "
+            "Install via: pip install networkx"
+        )
+    
+    # Convert sparse matrix to networkx graph
+    G = nx.from_scipy_sparse_array(adjacency_matrix)
+    
+    # Detect communities (greedy modularity optimization)
+    # Use community.greedy_modularity_communities as fallback
+    try:
+        communities_gen = community.greedy_modularity_communities(
+            G, weight=None, seed=random_state
+        )
+    except TypeError:
+        # Older networkx versions don't support seed parameter
+        communities_gen = community.greedy_modularity_communities(G, weight=None)
+    
+    # Convert to node -> community label mapping
+    community_map = {}
+    for comm_idx, comm_nodes in enumerate(communities_gen):
+        for node in comm_nodes:
+            community_map[node] = comm_idx
+    
+    # Create array form
+    communities = np.array([community_map.get(i, 0) for i in range(G.number_of_nodes())])
+    
+    return communities
+
+
+def find_communities_walktrap(
+    adjacency_matrix: csr_matrix,
+    steps: int = 4,
+    random_state: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Detect communities using walktrap algorithm (via igraph if available).
+    
+    Parameters
+    ----------
+    adjacency_matrix : csr_matrix
+        Symmetric adjacency matrix.
+    steps : int, default=4
+        Length of random walks for walktrap algorithm.
+    random_state : int, optional
+        Random seed (used for networkx fallback).
+    
+    Returns
+    -------
+    communities : ndarray
+        Community assignment for each node (0-indexed).
+    """
+    try:
+        import igraph as ig
+        
+        # Convert sparse matrix to igraph
+        n = adjacency_matrix.shape[0]
+        edges = list(zip(*adjacency_matrix.nonzero()))
+        G = ig.Graph(n, edges)
+        
+        # Detect communities using walktrap
+        clustering = G.community_walktrap(steps=steps)
+        membership = clustering.as_clustering().membership
+        communities = np.array(membership)
+        
+        return communities
+    except ImportError:
+        # Fallback to Louvain if igraph not available
+        return find_communities_louvain(adjacency_matrix, random_state=random_state)
+
+
+def make_super_cells(
+    gex_matrix: np.ndarray,
+    gamma: int = 10,
+    n_pcs: int = 25,
+    k_nn: int = 5,
+    random_state: Optional[int] = None,
+    gene_names: Optional[np.ndarray] = None,
+    cell_names: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Create super-cells by: PCA → kNN → community detection → aggregation.
+    
+    Parameters
+    ----------
+    gex_matrix : ndarray
+        Expression matrix (genes × cells).
+    gamma : int, default=10
+        Target aggregation level (desired cells/super-cell).
+    n_pcs : int, default=25
+        Number of PCA components.
+    k_nn : int, default=5
+        Number of nearest neighbors.
+    random_state : int, optional
+        Random seed for reproducibility.
+    gene_names : ndarray, optional
+        Gene names (n_genes,).
+    cell_names : ndarray, optional
+        Cell names (n_cells,).
+    
+    Returns
+    -------
+    super_cell_expr : ndarray
+        Super-cell expression matrix (genes × super_cells).
+    super_cell_assignment : ndarray
+        Assignment of cells to super-cells (n_cells,).
+    super_cell_gene_names : ndarray, optional
+        Gene names (unchanged).
+    super_cell_names : ndarray, optional
+        Super-cell names (generated if cell_names provided).
+    """
+    n_genes, n_cells = gex_matrix.shape
+    
+    # Step 1: PCA on cells (transposed)
+    gex_t = gex_matrix.T  # cells × genes
+    pca_model, gex_pca = build_pca(gex_t, n_components=n_pcs, random_state=random_state)
+    
+    # Step 2: Build kNN graph
+    neighbor_indices, neighbor_distances = build_knn_graph(
+        gex_pca, k=k_nn, random_state=random_state
+    )
+    
+    # Step 3: Create adjacency matrix
+    adjacency = build_knn_sparse_matrix(neighbor_indices, n_nodes=n_cells, symmetric=True)
+    
+    # Step 4: Community detection
+    communities = find_communities_louvain(adjacency, random_state=random_state)
+    
+    # Step 5: Aggregate cells within each community
+    unique_communities = np.unique(communities)
+    n_super_cells = len(unique_communities)
+    
+    super_cell_expr = np.zeros((n_genes, n_super_cells))
+    super_cell_assignment = np.zeros(n_cells, dtype=int)
+    
+    for sc_idx, comm_id in enumerate(unique_communities):
+        cell_mask = communities == comm_id
+        super_cell_expr[:, sc_idx] = gex_matrix[:, cell_mask].mean(axis=1)
+        super_cell_assignment[cell_mask] = sc_idx
+    
+    # Generate names if input provided
+    result = [super_cell_expr, super_cell_assignment]
+    
+    if gene_names is not None:
+        result.append(gene_names)
+    else:
+        result.append(None)
+    
+    if cell_names is not None:
+        super_cell_names = np.array([
+            f"SC_{i}" for i in range(n_super_cells)
+        ])
+        result.append(super_cell_names)
+    else:
+        result.append(None)
+    
+    return tuple(result)
+
+
+def aggregate_by_groups(
+    gex_matrix: np.ndarray,
+    group_labels: np.ndarray,
+    gene_names: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
+    """
+    Aggregate expression by group labels (e.g., cell types).
+    
+    Parameters
+    ----------
+    gex_matrix : ndarray
+        Expression matrix (genes × cells).
+    group_labels : ndarray
+        Group assignment for each cell (n_cells,).
+    gene_names : ndarray, optional
+        Gene names (n_genes,).
+    
+    Returns
+    -------
+    grouped_expr : ndarray
+        Aggregated expression (genes × n_groups).
+    unique_groups : ndarray
+        Unique group labels.
+    gene_names_out : ndarray, optional
+        Gene names (unchanged).
+    group_names : ndarray
+        Group names (sorted unique labels).
+    """
+    unique_groups = np.unique(group_labels)
+    n_genes = gex_matrix.shape[0]
+    
+    grouped_expr = np.zeros((n_genes, len(unique_groups)))
+    
+    for idx, group in enumerate(unique_groups):
+        mask = group_labels == group
+        grouped_expr[:, idx] = gex_matrix[:, mask].mean(axis=1)
+    
+    result = [grouped_expr, unique_groups]
+    if gene_names is not None:
+        result.append(gene_names)
+    else:
+        result.append(None)
+    result.append(unique_groups)
+    
+    return tuple(result)

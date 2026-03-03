@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-exclude scorpion *.bak
+recursive-exclude scorpion/tests *
+recursive-exclude scorpion/scorpion *
+prune scorpion/tests
+prune scorpion/scorpion

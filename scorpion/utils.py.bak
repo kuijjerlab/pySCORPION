@@ -1,0 +1,306 @@
+"""
+Utility functions for SCORPION: correlation computation, scaling, network utilities.
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr, pearsonr
+from scipy.sparse import issparse, csr_matrix, csc_matrix
+from sklearn.preprocessing import StandardScaler
+from typing import Tuple, Union, List, Dict
+
+
+def compute_correlation(
+    data: Union[np.ndarray, csr_matrix, csc_matrix],
+    method: str = "pearson",
+) -> np.ndarray:
+    """
+    Compute correlation matrix from expression data.
+    
+    Parameters
+    ----------
+    data : {ndarray, csr_matrix, csc_matrix}
+        Expression matrix (genes × cells) or (cells × genes) depending on orientation.
+        Should be genes in rows, cells in columns for this function.
+    method : str, default="pearson"
+        Correlation method: "pearson" or "spearman".
+    
+    Returns
+    -------
+    correlation_matrix : ndarray
+        Correlation matrix (genes × genes).
+    """
+    if issparse(data):
+        data = data.toarray()
+    
+    if method == "pearson":
+        corr_matrix = np.corrcoef(data)
+    elif method == "spearman":
+        corr_matrix = spearmanr(data.T)[0]  # Compute across cells (genes as variables)
+    else:
+        raise ValueError(f"Unknown correlation method: {method}")
+    
+    # Handle NaN values (genes with zero variance)
+    corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
+    
+    return corr_matrix
+
+
+def normalize_network(
+    network: np.ndarray,
+    method: str = "zscore",
+    axis: int = None,
+) -> np.ndarray:
+    """
+    Normalize network weights (gene regulatory, co-regulation, or cooperation).
+    
+    Parameters
+    ----------
+    network : ndarray
+        Network weight matrix.
+    method : str, default="zscore"
+        Normalization method: "zscore" (z-score) or "range" ([0,1] range).
+    axis : int, optional
+        Axis along which to normalize. If None, normalize entire matrix.
+    
+    Returns
+    -------
+    normalized_network : ndarray
+        Normalized network.
+    """
+    if method == "zscore":
+        if axis is None:
+            scaler = StandardScaler()
+            shape = network.shape
+            normalized = scaler.fit_transform(network.reshape(-1, 1)).reshape(shape)
+        else:
+            if axis == 0:
+                mean = network.mean(axis=0, keepdims=True)
+                std = network.std(axis=0, keepdims=True)
+            else:
+                mean = network.mean(axis=1, keepdims=True)
+                std = network.std(axis=1, keepdims=True)
+            normalized = (network - mean) / (std + 1e-10)
+    elif method == "range":
+        min_val = network.min()
+        max_val = network.max()
+        normalized = (network - min_val) / (max_val - min_val + 1e-10)
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
+    
+    return np.nan_to_num(normalized, nan=0.0)
+
+
+def hamming_distance(X: np.ndarray, Y: np.ndarray) -> float:
+    """
+    Compute normalized Hamming distance between two binary/real matrices.
+    
+    For convergence checking in PANDA: measures relative change in edges.
+    
+    Parameters
+    ----------
+    X : ndarray
+        Matrix 1 (e.g., old regulatory network).
+    Y : ndarray
+        Matrix 2 (e.g., new regulatory network).
+    
+    Returns
+    -------
+    distance : float
+        Normalized Hamming distance (0-1).
+    """
+    diff = np.abs(X - Y)
+    total = np.abs(X) + np.abs(Y)
+    # Avoid division by zero
+    with np.errstate(divide='ignore', invalid='ignore'):
+        distance = np.divide(diff, total, where=total != 0, out=np.zeros_like(diff))
+    return np.mean(distance)
+
+
+def normalize_edges(
+    edges: Union[np.ndarray, pd.DataFrame],
+    method: str = "zscore",
+) -> Union[np.ndarray, pd.DataFrame]:
+    """
+    Normalize edge weights in a network edge list or matrix.
+    
+    Parameters
+    ----------
+    edges : {ndarray, DataFrame}
+        Edge matrix (rows=edges, last column=weights) or DataFrame.
+    method : str, default="zscore"
+        Normalization method: "zscore" or "range".
+    
+    Returns
+    -------
+    normalized_edges : same type as input
+        Normalized edges.
+    """
+    is_df = isinstance(edges, pd.DataFrame)
+    
+    if is_df:
+        edges_copy = edges.copy()
+        weights = edges_copy.iloc[:, -1].values
+    else:
+        edges_copy = edges.copy()
+        weights = edges_copy[:, -1]
+    
+    if method == "zscore":
+        normalized_weights = (weights - weights.mean()) / (weights.std() + 1e-10)
+    elif method == "range":
+        min_val = weights.min()
+        max_val = weights.max()
+        normalized_weights = (weights - min_val) / (max_val - min_val + 1e-10)
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
+    
+    if is_df:
+        edges_copy.iloc[:, -1] = normalized_weights
+    else:
+        edges_copy[:, -1] = normalized_weights
+    
+    return edges_copy
+
+
+def edge_list_to_matrix(
+    edge_list: pd.DataFrame,
+    gene_names: List[str] = None,
+    tf_names: List[str] = None,
+) -> Tuple[np.ndarray, List[str], List[str]]:
+    """
+    Convert edge list to matrix representation.
+    
+    Parameters
+    ----------
+    edge_list : DataFrame
+        Edge list with columns [source, target, weight].
+    gene_names : list, optional
+        Names of genes (rows). If None, inferred from edge_list.
+    tf_names : list, optional
+        Names of TFs/sources (columns). If None, inferred from edge_list.
+    
+    Returns
+    -------
+    matrix : ndarray
+        Edge matrix (genes × sources).
+    gene_names : list
+        Gene names (rows).
+    tf_names : list
+        TF names (columns).
+    """
+    if gene_names is None:
+        gene_names = sorted(set(edge_list.iloc[:, 1].values))
+    if tf_names is None:
+        tf_names = sorted(set(edge_list.iloc[:, 0].values))
+    
+    gene_to_idx = {gene: i for i, gene in enumerate(gene_names)}
+    tf_to_idx = {tf: i for i, tf in enumerate(tf_names)}
+    
+    matrix = np.zeros((len(gene_names), len(tf_names)))
+    
+    for _, row in edge_list.iterrows():
+        tf_idx = tf_to_idx.get(row.iloc[0])
+        gene_idx = gene_to_idx.get(row.iloc[1])
+        if tf_idx is not None and gene_idx is not None:
+            matrix[gene_idx, tf_idx] = row.iloc[2]
+    
+    return matrix, gene_names, tf_names
+
+
+def matrix_to_edge_list(
+    matrix: np.ndarray,
+    row_names: List[str],
+    col_names: List[str],
+    include_zeros: bool = False,
+) -> pd.DataFrame:
+    """
+    Convert matrix to edge list representation.
+    
+    Parameters
+    ----------
+    matrix : ndarray
+        Network matrix.
+    row_names : list
+        Row labels (targets for regulatory networks).
+    col_names : list
+        Column labels (sources/TFs for regulatory networks).
+    include_zeros : bool, default=False
+        Whether to include zero-weight edges.
+    
+    Returns
+    -------
+    edge_list : DataFrame
+        Edge list with columns [source, target, weight].
+    """
+    edges = []
+    for i, row_name in enumerate(row_names):
+        for j, col_name in enumerate(col_names):
+            weight = matrix[i, j]
+            if include_zeros or weight != 0:
+                edges.append({
+                    "source": col_name,
+                    "target": row_name,
+                    "weight": weight,
+                })
+    
+    return pd.DataFrame(edges)
+
+
+def restrict_networks(
+    edge_list: Union[np.ndarray, pd.DataFrame],
+    genes_in_scope: set,
+    tfs_in_scope: set = None,
+) -> Union[np.ndarray, pd.DataFrame]:
+    """
+    Restrict edge list to genes and TFs in scope.
+    
+    Used to implement "intersection" network mode: keep only edges where both
+    source and target are present in provided scope sets.
+    
+    Parameters
+    ----------
+    edge_list : {ndarray, DataFrame}
+        Edge list (cols: [source, target, weight, ...]).
+    genes_in_scope : set
+        Set of valid gene/target names.
+    tfs_in_scope : set, optional
+        Set of valid TF/source names. If None, use genes_in_scope.
+    
+    Returns
+    -------
+    restricted_edges : same type as input
+        Filtered edge list.
+    """
+    if tfs_in_scope is None:
+        tfs_in_scope = genes_in_scope
+    
+    is_df = isinstance(edge_list, pd.DataFrame)
+    
+    if is_df:
+        mask = (edge_list.iloc[:, 0].isin(tfs_in_scope)) & \
+               (edge_list.iloc[:, 1].isin(genes_in_scope))
+        return edge_list[mask].reset_index(drop=True)
+    else:
+        # Assume ndarray with [source, target, weight, ...]
+        mask = np.array([
+            (row[0] in tfs_in_scope) and (row[1] in genes_in_scope)
+            for row in edge_list[:, :2]
+        ])
+        return edge_list[mask]
+
+
+def set_random_seed(seed: int) -> None:
+    """
+    Set random seed for reproducibility across NumPy and scikit-learn.
+    
+    Parameters
+    ----------
+    seed : int
+        Random seed.
+    """
+    np.random.seed(seed)
+    try:
+        from sklearn.utils._random import check_random_state
+        check_random_state(seed)
+    except ImportError:
+        pass
