@@ -17,10 +17,13 @@ authors = [
 keywords = [
     "single-cell",
     "gene-regulatory-networks",
-    "bioinformatics",
-    "PANDA",
+    "transcription-factors",
+    "transcriptomics",
     "SCORPION",
-    "scRNA-seq",
+    "protein-protein-interaction",
+    "cell-type-specific",
+    "comparative-edge-analysis",
+    "population-comparison",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -53,7 +56,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/kuijjerlab/SCORPION"
-Repository = "https://github.com/dcosorioh/pySCORPION"
+Repository = "https://github.com/kuijjerlab/pySCORPION"
 
 [tool.setuptools.packages.find]
 include = ["scorpion*"]
