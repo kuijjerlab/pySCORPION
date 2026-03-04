@@ -126,7 +126,7 @@ A dictionary containing:
 |-----------|-------------|
 | `regNet` | Regulatory network matrix (TFs × target genes) |
 | `coregNet` | Co-regulation network matrix (genes × genes) |
-| `coopNet` | TF cooperation network matrix (TFs × TFs) |
+| `coopNet` | TF cooperative network matrix (TFs × TFs) |
 | `numGenes` | Number of genes in the network |
 | `numTFs` | Number of transcription factors |
 | `numEdges` | Total number of edges in the regulatory network |
