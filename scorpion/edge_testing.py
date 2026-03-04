@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats as scipy_stats
 from typing import List, Optional, Dict
+import warnings
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +458,23 @@ def test_edges(
     ...     paired=True,
     ... )
     """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return _test_edges_impl(
+            networks_df=networks_df, test_type=test_type,
+            group1=group1, group2=group2, paired=paired,
+            alternative=alternative, padjust_method=padjust_method,
+            min_log2fc=min_log2fc, moderate_variance=moderate_variance,
+            empirical_null=empirical_null,
+        )
+
+
+def _test_edges_impl(
+    networks_df, test_type, group1, group2, paired,
+    alternative, padjust_method, min_log2fc,
+    moderate_variance, empirical_null,
+) -> pd.DataFrame:
+    """Internal implementation of test_edges(), called inside a warnings context."""
     # Normalize parameter values (accept both Python-style and R-style)
     test_type = test_type.replace("_", ".")
     alternative = alternative.replace("_", ".")
@@ -612,6 +630,20 @@ def regress_edges(
     ...     },
     ... )
     """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return _regress_edges_impl(
+            networks_df=networks_df,
+            ordered_groups=ordered_groups,
+            padjust_method=padjust_method,
+            min_mean_edge=min_mean_edge,
+        )
+
+
+def _regress_edges_impl(
+    networks_df, ordered_groups, padjust_method, min_mean_edge,
+) -> pd.DataFrame:
+    """Internal implementation of regress_edges(), called inside a warnings context."""
     # Validate
     if ordered_groups is None or len(ordered_groups) < 2:
         raise ValueError("ordered_groups must contain at least 2 conditions")

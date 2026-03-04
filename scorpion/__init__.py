@@ -12,5 +12,6 @@ __version__ = "0.1.0"
 
 from .core import scorpion, run_scorpion
 from .edge_testing import test_edges, regress_edges
+from .datasets import load_example_data
 
-__all__ = ["scorpion", "run_scorpion", "test_edges", "regress_edges"]
+__all__ = ["scorpion", "run_scorpion", "test_edges", "regress_edges", "load_example_data"]

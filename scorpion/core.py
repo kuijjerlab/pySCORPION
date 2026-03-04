@@ -146,6 +146,27 @@ def scorpion(
     >>> print(net["regNet"].shape)
     >>> print(f"Edges: {net['numEdges']}")
     """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return _scorpion_impl(
+            gex_matrix=gex_matrix, tf_motifs=tf_motifs, ppi_net=ppi_net,
+            computing_engine=computing_engine, n_cores=n_cores,
+            gamma_value=gamma_value, n_pc=n_pc, assoc_method=assoc_method,
+            alpha_value=alpha_value, hamming_value=hamming_value, n_iter=n_iter,
+            out_net=out_net, z_scaling=z_scaling, show_progress=show_progress,
+            randomization_method=randomization_method,
+            scale_by_present=scale_by_present, filter_expr=filter_expr,
+            random_state=random_state, gene_names=gene_names,
+        )
+
+
+def _scorpion_impl(
+    gex_matrix, tf_motifs, ppi_net, computing_engine, n_cores,
+    gamma_value, n_pc, assoc_method, alpha_value, hamming_value, n_iter,
+    out_net, z_scaling, show_progress, randomization_method,
+    scale_by_present, filter_expr, random_state, gene_names,
+) -> Dict:
+    """Internal implementation of scorpion(), called inside a warnings context."""
     if random_state is not None:
         set_random_seed(random_state)
     
@@ -419,6 +440,33 @@ def run_scorpion(
     ... )
     >>> print(networks.shape)
     """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return _run_scorpion_impl(
+            gex_matrix=gex_matrix, tf_motifs=tf_motifs, ppi_net=ppi_net,
+            cells_metadata=cells_metadata, group_by=group_by,
+            normalize_data=normalize_data,
+            remove_batch_effect=remove_batch_effect, batch=batch,
+            min_cells=min_cells, computing_engine=computing_engine,
+            n_cores=n_cores, gamma_value=gamma_value, n_pc=n_pc,
+            assoc_method=assoc_method, alpha_value=alpha_value,
+            hamming_value=hamming_value, n_iter=n_iter, out_net=out_net,
+            z_scaling=z_scaling, show_progress=show_progress,
+            randomization_method=randomization_method,
+            scale_by_present=scale_by_present, filter_expr=filter_expr,
+            random_state=random_state,
+        )
+
+
+def _run_scorpion_impl(
+    gex_matrix, tf_motifs, ppi_net, cells_metadata, group_by,
+    normalize_data, remove_batch_effect, batch, min_cells,
+    computing_engine, n_cores, gamma_value, n_pc, assoc_method,
+    alpha_value, hamming_value, n_iter, out_net, z_scaling,
+    show_progress, randomization_method, scale_by_present,
+    filter_expr, random_state,
+) -> pd.DataFrame:
+    """Internal implementation of run_scorpion(), called inside a warnings context."""
     if random_state is not None:
         set_random_seed(random_state)
     

@@ -10,12 +10,6 @@
 pip install pyscorpion
 ```
 
-For walktrap community detection (recommended, matches R implementation):
-
-```bash
-pip install pyscorpion[igraph]
-```
-
 To install the development version from GitHub:
 
 ```bash
@@ -27,23 +21,43 @@ pip install git+https://github.com/dcosorioh/pySCORPION.git
 ## Quick Start
 
 ```python
-from scorpion import scorpion, run_scorpion
+from scorpion import load_example_data, scorpion, run_scorpion
+
+# Load the bundled example dataset
+data = load_example_data()
 
 # Construct a single regulatory network
 network = scorpion(
-    tf_motifs=motif_prior,
-    gex_matrix=expression_data,
-    ppi_net=ppi_network,
+    gex_matrix=data["gex_matrix"],
+    tf_motifs=data["tf_motifs"],
+    ppi_net=data["ppi_net"],
 )
 
 # Construct networks stratified by cell groups
 networks = run_scorpion(
-    gex_matrix=expression_data,
-    tf_motifs=motif_prior,
-    ppi_net=ppi_network,
-    cells_metadata=metadata,
+    gex_matrix=data["gex_matrix"],
+    tf_motifs=data["tf_motifs"],
+    ppi_net=data["ppi_net"],
+    cells_metadata=data["metadata"],
     group_by="region",
 )
+```
+
+---
+
+## Example Data
+
+The package ships with a colorectal cancer single-cell RNA-seq dataset (300 genes, ~1 950 cells, 3 donors, 3 tissue regions) that can be loaded with a single call:
+
+```python
+from scorpion import load_example_data
+
+data = load_example_data()
+
+data["gex_matrix"]   # Gene expression matrix (genes × cells)
+data["tf_motifs"]    # TF–target motif prior network
+data["ppi_net"]      # Protein–protein interaction network
+data["metadata"]     # Cell-level metadata (cell_id, donor, region, cell_type)
 ```
 
 ---
