@@ -13,7 +13,7 @@ pip install pyscorpion
 To install the development version from GitHub:
 
 ```bash
-pip install git+https://github.com/dcosorioh/pySCORPION.git
+pip install git+https://github.com/kuijjerlab/pySCORPION.git
 ```
 
 ---
