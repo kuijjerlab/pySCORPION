@@ -186,32 +186,35 @@ A DataFrame in wide format where:
 **Examples:**
 
 ```python
-from scorpion import run_scorpion
+from scorpion import load_example_data, scorpion, run_scorpion
+
+# Load example data
+data = load_example_data()
 
 # Stratify by tissue region
 nets_by_region = run_scorpion(
-    gex_matrix=expression_data,
-    tf_motifs=motif_prior,
-    ppi_net=ppi_network,
-    cells_metadata=metadata,
+    gex_matrix=data["gex_matrix"],
+    tf_motifs=data["tf_motifs"],
+    ppi_net=data["ppi_net"],
+    cells_metadata=data["metadata"],
     group_by="region",
 )
 
 # Stratify by multiple variables
 nets_by_donor_region = run_scorpion(
-    gex_matrix=expression_data,
-    tf_motifs=motif_prior,
-    ppi_net=ppi_network,
-    cells_metadata=metadata,
+    gex_matrix=data["gex_matrix"],
+    tf_motifs=data["tf_motifs"],
+    ppi_net=data["ppi_net"],
+    cells_metadata=data["metadata"],
     group_by=["donor", "region"],
 )
 
 # With batch effect correction
 nets_corrected = run_scorpion(
-    gex_matrix=expression_data,
-    tf_motifs=motif_prior,
-    ppi_net=ppi_network,
-    cells_metadata=metadata,
+    gex_matrix=data["gex_matrix"],
+    tf_motifs=data["tf_motifs"],
+    ppi_net=data["ppi_net"],
+    cells_metadata=data["metadata"],
     group_by="region",
     remove_batch_effect=True,
     batch="donor",
@@ -280,12 +283,12 @@ A DataFrame containing:
 from scorpion import test_edges
 
 # Define groups
-tumor_nets = [c for c in nets.columns if c.endswith("--T")]
-normal_nets = [c for c in nets.columns if c.endswith("--N")]
+tumor_nets = [c for c in nets_by_donor_region.columns if c.endswith("--T")]
+normal_nets = [c for c in nets_by_donor_region.columns if c.endswith("--N")]
 
 # Two-sample comparison: Tumor vs Normal
 results = test_edges(
-    networks_df=nets,
+    networks_df=nets_by_donor_region,
     test_type="two.sample",
     group1=tumor_nets,
     group2=normal_nets,
@@ -296,7 +299,7 @@ tumor_ordered = ["P31--T", "P32--T", "P33--T"]
 normal_ordered = ["P31--N", "P32--N", "P33--N"]
 
 results_paired = test_edges(
-    networks_df=nets,
+    networks_df=nets_by_donor_region,
     test_type="two.sample",
     group1=tumor_ordered,
     group2=normal_ordered,
@@ -305,7 +308,7 @@ results_paired = test_edges(
 
 # Single-sample test: edges differing from zero
 results_single = test_edges(
-    networks_df=nets,
+    networks_df=nets_by_region,
     test_type="single",
     group1=tumor_nets,
 )
@@ -359,9 +362,9 @@ A DataFrame containing:
 from scorpion import regress_edges
 
 # Define ordered progression: Normal → Border → Tumor
-normal_nets = [c for c in nets.columns if c.endswith("--N")]
-border_nets = [c for c in nets.columns if c.endswith("--B")]
-tumor_nets = [c for c in nets.columns if c.endswith("--T")]
+normal_nets = [c for c in nets_by_donor_region.columns if c.endswith("--N")]
+border_nets = [c for c in nets_by_donor_region.columns if c.endswith("--B")]
+tumor_nets = [c for c in nets_by_donor_region.columns if c.endswith("--T")]
 
 ordered_conditions = {
     "Normal": normal_nets,
@@ -371,7 +374,7 @@ ordered_conditions = {
 
 # Identify edges with significant trends
 results_reg = regress_edges(
-    networks_df=nets,
+    networks_df=nets_by_donor_region,
     ordered_groups=ordered_conditions,
 )
 
