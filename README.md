@@ -390,7 +390,7 @@ decreasing = results_reg[(results_reg["pAdj"] < 0.05) & (results_reg["slope"] < 
 - pandas (>=1.3)
 - SciPy (>=1.7)
 - scikit-learn (>=1.0)
-- igraph (>=0.10, optional, for walktrap clustering)
+- igraph (>=0.10)
 
 ---
 
