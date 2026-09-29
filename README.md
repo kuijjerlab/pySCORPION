@@ -101,7 +101,7 @@ result = scorpion(
 | `gex_matrix` | Expression matrix with genes in rows and cells in columns | Required |
 | `tf_motifs` | DataFrame with columns [TF, target gene, motif score]. Pass `None` for co-expression analysis only | `None` |
 | `ppi_net` | DataFrame with columns [protein1, protein2, interaction score]. Pass `None` to disable PPI integration | `None` |
-| `computing_engine` | Computation backend: `"cpu"` or `"gpu"` | `"cpu"` |
+| `computing_engine` | Computation backend: `"cpu"` or `"gpu"` (GPU is not implemented in Python; falls back to CPU with a warning) | `"cpu"` |
 | `n_cores` | Number of processors for BLAS/MPI parallel computation | `1` |
 | `gamma_value` | Coarse-graining level; ratio of cells to super-cells | `10` |
 | `n_pc` | Number of principal components for kNN network construction | `25` |
@@ -112,7 +112,7 @@ result = scorpion(
 | `out_net` | Networks to return: `"regNet"`, `"coregNet"`, and/or `"coopNet"` | All three |
 | `z_scaling` | Return Z-score normalized edge weights; `False` returns [0,1] scale | `True` |
 | `show_progress` | Print progress messages during computation | `True` |
-| `randomization_method` | Randomization for null models: `None`, `"within_gene"`, or `"by_gene"` | `None` |
+| `randomization_method` | Randomization for null models: `None`, `"within.gene"`, or `"by.gene"` (underscore spellings also accepted) | `None` |
 | `scale_by_present` | Scale correlations by percentage of cells with non-zero expression | `False` |
 | `filter_expr` | Remove genes with zero expression across all cells before inference | `False` |
 | `random_state` | Random seed for reproducibility | `None` |
@@ -130,6 +130,8 @@ A dictionary containing:
 | `numGenes` | Number of genes in the network |
 | `numTFs` | Number of transcription factors |
 | `numEdges` | Total number of edges in the regulatory network |
+
+When both `tf_motifs` and `ppi_net` are `None`, `scorpion()` returns the gene-gene co-expression matrix of the super-cells as a DataFrame.
 
 ---
 
@@ -164,17 +166,20 @@ networks = run_scorpion(
 | `group_by` | String or list of column name(s) in `cells_metadata` for stratification | Required |
 | `normalize_data` | Apply log normalization to expression data before network inference | `True` |
 | `remove_batch_effect` | Perform batch effect correction before network inference | `False` |
-| `batch` | Column name in `cells_metadata` giving batch assignment for each cell; required if `remove_batch_effect=True` | `None` |
-| `min_cells` | Minimum number of cells required per group to build a network | `30` |
+| `batch` | Batch assignment for each cell, as a per-cell vector or a column name in `cells_metadata`; required if `remove_batch_effect=True`. The per-gene median is added back after correction; with a single batch level, correction is skipped | `None` |
+| `min_cells` | Minimum number of cells required per group to build a network (values below 30 are raised to 30) | `30` |
+| `n_cores` | Number of worker processes used to build the group networks in parallel | `1` |
+| `out_net` | Network(s) to extract: `"regNet"`, `"coregNet"`, `"coopNet"`, or a list of them | `"regNet"` |
 
-**Additional parameters:** All `scorpion()` parameters (`computing_engine`, `n_cores`, `gamma_value`, `n_pc`, `assoc_method`, `alpha_value`, `hamming_value`, `n_iter`, `out_net`, `z_scaling`, `show_progress`, `randomization_method`, `scale_by_present`, `filter_expr`) can be passed to control network inference behavior. See `scorpion()` documentation above.
+**Additional parameters:** All other `scorpion()` parameters (`computing_engine`, `gamma_value`, `n_pc`, `assoc_method`, `alpha_value`, `hamming_value`, `n_iter`, `z_scaling`, `show_progress`, `randomization_method`, `scale_by_present`, `filter_expr`) can be passed to control network inference behavior. See `scorpion()` documentation above.
 
 **Return value:**
 
 A DataFrame in wide format where:
-- Rows represent TF-target pairs
-- Columns represent network identifiers (derived from `group_by` values)
-- Values are edge weights from each network
+- Rows represent TF-target pairs (the full grid over the union of all networks' TFs and targets)
+- Columns represent network identifiers (derived from `group_by` values, in order of first appearance)
+- Values are edge weights from each network; pairs absent from a group's network are `NaN`
+- When several networks are requested in `out_net`, a leading `edge_type` column (`"tf-target"`, `"gene-gene"`, `"tf-tf"`) is added and the network types are stacked
 
 **Example output:**
 
@@ -243,6 +248,8 @@ results = test_edges(
     min_log2fc=0.0,
     moderate_variance=True,
     empirical_null=True,
+    n_cores=1,
+    batch_size=None,
 )
 ```
 
@@ -256,10 +263,12 @@ results = test_edges(
 | `group2` | List of column names for the second group (two-sample tests) | `None` |
 | `paired` | Perform paired t-test; requires equal-length groups in matched order | `False` |
 | `alternative` | Alternative hypothesis: `"two.sided"`, `"greater"`, or `"less"` | `"two.sided"` |
-| `padjust_method` | Multiple testing correction method (see `statsmodels.stats.multitest`) | `"BH"` |
+| `padjust_method` | Multiple testing correction, as in R's `p.adjust`: `"holm"`, `"hochberg"`, `"hommel"`, `"bonferroni"`, `"BH"`, `"BY"`, `"fdr"`, `"none"` | `"BH"` |
 | `min_log2fc` | Minimum absolute log2 fold change for inclusion (two-sample/paired only) | `0.0` |
 | `moderate_variance` | Apply SAM-style variance moderation; adds median(SE) to denominator | `True` |
 | `empirical_null` | Use Efron's empirical null (median/MAD) for p-value calibration | `True` |
+| `n_cores` | Number of parallel workers; edges are processed in batches and the moderation factor is computed once over all edges | `1` |
+| `batch_size` | Edges per batch when `n_cores > 1`; `None` uses `ceil(n_edges / n_cores)` | `None` |
 
 **Return value:**
 
@@ -268,11 +277,11 @@ A DataFrame containing:
 | Column | Description |
 |--------|-------------|
 | `tf`, `target` | TF-target pair identifiers |
-| `meanEdge` | Mean edge weight (single-sample) |
 | `meanGroup1`, `meanGroup2` | Group means (two-sample) |
-| `diffMean` | Difference in means, Group1 − Group2 (two-sample) |
 | `cohensD` | Cohen's d effect size (two-sample and paired tests) |
-| `log2FoldChange` | Log2 fold change (two-sample) |
+| `log2FoldChange` | Difference in mean edge weight, Group1 − Group2 (two-sample) |
+| `meanEdge` | Mean edge weight |
+| `SE` | Raw, unmoderated standard error (input for `ma_edges()`) |
 | `tStatistic` | t-statistic |
 | `pValue` | Raw p-value |
 | `pAdj` | Adjusted p-value |
@@ -383,6 +392,64 @@ increasing = results_reg[(results_reg["pAdj"] < 0.05) & (results_reg["slope"] > 
 
 # Edges decreasing along progression
 decreasing = results_reg[(results_reg["pAdj"] < 0.05) & (results_reg["slope"] < 0)]
+```
+
+---
+
+### ma_edges
+
+Performs a meta-analysis of TF-target edges across studies using either a DerSimonian-Laird random-effects or an inverse-variance fixed-effect model. Each study is typically a `test_edges()` result. A study contributes to a TF-target pair only when both its effect size and SE are valid.
+
+**Usage:**
+
+```python
+meta = ma_edges(
+    edges_list=[study1, study2, study3],
+    method="random",
+    min_studies=2,
+    padjust_method="BH",
+    moderate_variance=True,
+    s0=None,
+)
+```
+
+**Parameters:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `edges_list` | List (or dict) of DataFrames with columns `tf`, `target`, `log2FoldChange` and `SE`; at least two | Required |
+| `method` | `"random"` (DerSimonian-Laird) or `"fixed"` (inverse-variance) | `"random"` |
+| `min_studies` | Minimum number of studies with valid data for a TF-target pair to be included | `2` |
+| `padjust_method` | Multiple testing correction method (as in `test_edges()`) | `"BH"` |
+| `moderate_variance` | Apply SAM-style moderation to the meta-analysis SE | `True` |
+| `s0` | Moderation fudge factor; `None` uses the median of all meta-analysis SEs | `None` |
+
+**Return value:**
+
+A DataFrame sorted by `tf` and `target` containing:
+
+| Column | Description |
+|--------|-------------|
+| `tf`, `target` | TF-target pair identifiers |
+| `k` | Number of contributing studies |
+| `log2FoldChange` | Meta-analytic effect size |
+| `SE` | Meta-analysis standard error (unmoderated) |
+| `ciLow`, `ciHigh` | 95% confidence interval |
+| `zStatistic` | Test statistic |
+| `pValue`, `pAdj` | Raw and adjusted p-values |
+| `Q` | Cochran's Q heterogeneity statistic |
+| `iSquared` | I² heterogeneity (percentage) |
+| `tauSquared` | DerSimonian-Laird between-study variance |
+
+**Example:**
+
+```python
+from scorpion import test_edges, ma_edges
+
+study1 = test_edges(nets_cohort1, test_type="two.sample", group1=t1, group2=n1)
+study2 = test_edges(nets_cohort2, test_type="two.sample", group1=t2, group2=n2)
+
+meta = ma_edges([study1, study2], method="random")
 ```
 
 ---

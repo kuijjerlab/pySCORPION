@@ -262,3 +262,84 @@ class TestScorpionComputation:
         assert np.all(np.isfinite(result["regNet"]))
         assert np.all(np.isfinite(result["coregNet"]))
         assert np.all(np.isfinite(result["coopNet"]))
+
+
+class TestScorpionRParity:
+    """Behaviour added to match R's scorpion()."""
+
+    def test_coexpression_only(self, toy_expression):
+        """No priors: return the super-cell gene-gene correlation matrix."""
+        result = scorpion(toy_expression, show_progress=False)
+        assert isinstance(result, pd.DataFrame)
+        assert result.shape == (100, 100)
+        assert list(result.index) == list(toy_expression.index)
+        np.testing.assert_allclose(result.values, result.values.T)
+        np.testing.assert_allclose(np.diag(result.values), 1.0)
+
+    def test_coexpression_spearman(self, toy_expression):
+        pearson = scorpion(toy_expression, show_progress=False, random_state=0)
+        spearman = scorpion(toy_expression, assoc_method="spearman",
+                            show_progress=False, random_state=0)
+        assert not np.allclose(pearson.values, spearman.values)
+
+    def test_filter_expr(self, toy_expression, toy_motifs):
+        """filter_expr drops all-zero genes before inference."""
+        gex = toy_expression.copy()
+        gene = toy_motifs["target"].iloc[0]
+        gex.loc[gene] = 0.0
+        result = scorpion(gex, toy_motifs, filter_expr=True, show_progress=False)
+        assert gene not in list(result["geneNames"])
+        kept = scorpion(toy_expression, toy_motifs, show_progress=False)
+        assert gene in list(kept["geneNames"])
+
+    def test_scale_by_present(self, toy_expression, toy_motifs):
+        # Gene-specific dropout so co-presence differs between gene pairs
+        rng = np.random.default_rng(0)
+        gex = toy_expression.where(rng.random(toy_expression.shape) > 0.8, 0.0)
+        base = scorpion(gex, toy_motifs, show_progress=False, random_state=0)
+        scaled = scorpion(gex, toy_motifs, scale_by_present=True,
+                          show_progress=False, random_state=0)
+        assert not np.allclose(base["regNet"], scaled["regNet"])
+
+    @pytest.mark.parametrize("method", ["within.gene", "by.gene", "within_gene", "by_gene"])
+    def test_randomization(self, toy_expression, toy_motifs, method):
+        base = scorpion(toy_expression, toy_motifs, show_progress=False, random_state=0)
+        rand1 = scorpion(toy_expression, toy_motifs, randomization_method=method,
+                         show_progress=False, random_state=0)
+        rand2 = scorpion(toy_expression, toy_motifs, randomization_method=method,
+                         show_progress=False, random_state=0)
+        assert not np.allclose(base["regNet"], rand1["regNet"])
+        np.testing.assert_array_equal(rand1["regNet"], rand2["regNet"])
+
+    def test_randomization_none_string(self, toy_expression, toy_motifs):
+        a = scorpion(toy_expression, toy_motifs, show_progress=False, random_state=0)
+        b = scorpion(toy_expression, toy_motifs, randomization_method="None",
+                     show_progress=False, random_state=0)
+        np.testing.assert_array_equal(a["regNet"], b["regNet"])
+
+    def test_invalid_randomization(self, toy_expression, toy_motifs):
+        with pytest.raises(ValueError, match="randomization_method"):
+            scorpion(toy_expression, toy_motifs, randomization_method="bogus",
+                     show_progress=False)
+
+    def test_gpu_falls_back_to_cpu(self, toy_expression, toy_motifs):
+        with pytest.warns(UserWarning, match="Falling back to CPU"):
+            gpu = scorpion(toy_expression, toy_motifs, computing_engine="gpu",
+                           show_progress=False, random_state=0)
+        cpu = scorpion(toy_expression, toy_motifs, show_progress=False, random_state=0)
+        np.testing.assert_array_equal(gpu["regNet"], cpu["regNet"])
+
+    def test_invalid_parameters(self, toy_expression, toy_motifs):
+        with pytest.raises(ValueError, match="hamming_value"):
+            scorpion(toy_expression, toy_motifs, hamming_value=-1, show_progress=False)
+        with pytest.raises(ValueError, match="assoc_method"):
+            scorpion(toy_expression, toy_motifs, assoc_method="kendall", show_progress=False)
+        with pytest.raises(ValueError, match="computing_engine"):
+            scorpion(toy_expression, toy_motifs, computing_engine="tpu", show_progress=False)
+        with pytest.raises(ValueError, match="at least 10 genes"):
+            scorpion(toy_expression.iloc[:9], toy_motifs, show_progress=False)
+
+    def test_few_cells_warns(self, toy_expression, toy_motifs):
+        with pytest.warns(UserWarning, match="fewer than 30 cells"):
+            scorpion(toy_expression.iloc[:, :29], toy_motifs, gamma_value=3,
+                     n_pc=5, show_progress=False)

@@ -30,6 +30,8 @@ def run_panda(
     verbose: bool = True,
     gene_names: Optional[np.ndarray] = None,
     tf_names: Optional[np.ndarray] = None,
+    randomize: Optional[str] = None,
+    scale_by_present: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Run PANDA algorithm for network inference.
@@ -62,6 +64,14 @@ def run_panda(
         Gene names (n_genes,). Used to match motif targets.
     tf_names : ndarray, optional
         TF names. If None, derived from motifs.
+    randomize : str, optional
+        Randomization of the expression matrix for null models, as in R's
+        runPANDA(randomize=): None/"None" (default), "within.gene"
+        (permute each gene's values across samples) or "by.gene"
+        (permute gene labels). Underscore spellings are also accepted.
+    scale_by_present : bool, default=False
+        Scale correlations by the fraction of samples in which both genes
+        are expressed (> 0).
 
     Returns
     -------
@@ -159,6 +169,21 @@ def run_panda(
     else:
         expr_filtered = expression_matrix[:num_genes, :]
 
+    # Optional randomization of the expression data (null models)
+    randomize = "None" if randomize is None else str(randomize).replace("_", ".")
+    if randomize not in ("None", "within.gene", "by.gene"):
+        raise ValueError(
+            "randomization_method must be one of None, 'within.gene', 'by.gene'"
+        )
+    if randomize == "within.gene":
+        expr_filtered = np.array([np.random.permutation(row) for row in expr_filtered])
+        if verbose:
+            print("Randomizing by reordering each gene's expression")
+    elif randomize == "by.gene":
+        expr_filtered = expr_filtered[np.random.permutation(expr_filtered.shape[0]), :]
+        if verbose:
+            print("Randomizing by reordering each gene labels")
+
     # Compute gene co-regulation (genes x genes)
     num_conditions = expr_filtered.shape[1]
 
@@ -168,8 +193,15 @@ def run_panda(
         gene_coreg = np.eye(num_genes)
     else:
         gene_coreg = compute_correlation(expr_filtered, method=correlation_method)
-        np.fill_diagonal(gene_coreg, 1.0)
-        gene_coreg = np.nan_to_num(gene_coreg, nan=0.0)
+        if scale_by_present:
+            present = (np.asarray(expr_filtered) > 0).astype(float)
+            gene_coreg = gene_coreg * ((present @ present.T) / num_conditions)
+            if np.isnan(gene_coreg).any():
+                np.fill_diagonal(gene_coreg, 1.0)
+                gene_coreg = np.nan_to_num(gene_coreg, nan=0.0)
+        else:
+            np.fill_diagonal(gene_coreg, 1.0)
+            gene_coreg = np.nan_to_num(gene_coreg, nan=0.0)
 
     # Build PPI matrix (TFs x TFs) using vectorized indexing
     if ppi_network is None:
