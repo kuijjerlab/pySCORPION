@@ -1,0 +1,9 @@
+# Build artifacts (produced by CI)
+build/
+dist/
+*.egg-info/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/

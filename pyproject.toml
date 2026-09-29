@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyscorpion"
-version = "0.1.0"
+version = "0.2.0"
 description = "Constructs cell-type-specific gene regulatory networks from single-cell RNA-sequencing data using the SCORPION algorithm, which aggregates cells into super-cells and applies PANDA to infer transcription factor-target regulatory relationships."
 readme = "README.md"
 license = "GPL-3.0-only"

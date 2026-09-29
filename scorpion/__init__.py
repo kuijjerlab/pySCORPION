@@ -8,7 +8,7 @@ first aggregates individual cells into super-cells and then applies PANDA
 transcription factor-target regulatory relationships.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .core import scorpion, run_scorpion
 from .edge_testing import test_edges, regress_edges
